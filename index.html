@@ -449,7 +449,7 @@ const T={
 'delmatch.no':'Keep match',
 
 'rules.title':'Points and rules',
-'rules.intro':'Every value can be changed. Changes apply from the next match you start.',
+'rules.intro':'Every value can be changed. Changes apply right away to the match in progress and to every new match. Finished matches keep their scores.',
 'rules.g.break':'Break and pockets',
 'rules.g.direct':'Direct shots',
 'rules.g.streak':'Streaks',
@@ -458,7 +458,7 @@ const T={
 'rules.g.pen':'Penalties',
 'rules.f.breakPocket':'Ball pocketed on the break',
 'rules.f.pocket':'Called pocket',
-'rules.f.direct':'Direct shot bonus',
+'rules.f.direct':'Direct shot, called pocket (total)',
 'rules.f.streakStart':'Streak starts at ball number',
 'rules.f.streakBonus':'Bonus for each ball once it starts',
 'rules.f.railFirst':'Rail shot, first rail',
@@ -475,7 +475,8 @@ const T={
 'rules.f.scratch':'Scratch',
 'rules.f.hitOpp':'Hitting the opponent’s ball',
 'rules.streakBreak':'Break balls count toward streaks',
-'rules.note':'A turn continues after every called pocket. A miss, different pocket, scratch or foul passes the turn. A rail shot pocketed in a different pocket scores only the different-pocket penalty. Turn on “{toggle}” when a player has cleared their group; tap it again if it was a mistake.',
+'rules.streakDirect':'Direct shots count toward streaks',
+'rules.note':'A turn continues after every called pocket. A miss, different pocket, scratch or foul passes the turn. A rail shot pocketed in a different pocket scores only the different-pocket penalty. Direct shots don’t count toward a streak, but they don’t break it either. Turn on “{toggle}” when a player has cleared their group; tap it again if it was a mistake.',
 'rules.reset':'Reset to defaults',
 
 'hero.even':'YAW NILLA',
@@ -617,12 +618,13 @@ function t(k,v){
 
 /* ---------- constants ---------- */
 const KEY='chalk.v1';
+const RULES_VERSION=4;   /* bump when a default rule changes, so saved settings pick it up once */
 const LOCALE='en-GB';
 const COLORS=['#4A9DFF','#FFA033'];
 const DEFAULTS={
   breakPocket:2,pocket:1,direct:0.5,
-  streakStart:3,streakBonus:1.5,streakIncludesBreak:true,
-  railFirst:2,railExtra:3,directWrong:0,directMiss:-1.5,specialBasic:3,specialAdvanced:4,
+  streakStart:3,streakBonus:1.5,streakIncludesBreak:true,streakCountsDirect:false,directTotal:true,
+  railFirst:2,railExtra:3,directWrong:0,directMiss:-2,specialBasic:3,specialAdvanced:4,
   eight:1,eightLoss:-5,
   miss:-1,normalMiss:0,wrongPocket:-1,scratch:-2,hitOpp:-2
 };
@@ -659,6 +661,12 @@ const fmtDT=ts=>ts?dtF.format(new Date(ts)):'–';
 const fmtTM=ts=>ts?tmF.format(new Date(ts)):'';
 const ymd=ts=>{const d=new Date(ts);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');};
 
+function setRule(k,v){
+  store.settings[k]=v;
+  const m=store.current;
+  if(m&&m.stage!=='results')m.settings[k]=v;   /* the match in progress follows the rules sheet */
+  save();
+}
 function showToast(msg){
   const old=document.querySelector('.toast');if(old)old.remove();
   const el=document.createElement('div');el.className='toast';el.setAttribute('role','status');el.textContent=msg;
@@ -668,12 +676,16 @@ function showToast(msg){
 /* ---------- storage ---------- */
 function matchSettings(s){
   s=s||{};
+  let o;
   if(s.railFirst===undefined){
     /* played before the direct and rail rule change: keep exactly the scoring it had then */
     const b={...DEFAULTS,...s},per=b.railPerRail!==undefined?b.railPerRail:3;
-    return {...b,railFirst:per,railExtra:per,directMiss:b.miss,directWrong:r4(b.pocket+b.direct+b.wrongPocket)};
-  }
-  return {...DEFAULTS,...s};
+    o={...b,railFirst:per,railExtra:per,directMiss:b.miss,directWrong:r4(b.pocket+b.direct+b.wrongPocket)};
+  }else o={...DEFAULTS,...s};
+  /* matches played before the streak rule keep counting direct shots toward streaks */
+  if(s.streakCountsDirect===undefined)o.streakCountsDirect=true;
+  if(s.directTotal===undefined)o.directTotal=false;   /* matches played before: a direct pocket was +1 plus the bonus */
+  return o;
 }
 function migrateMatch(m){
   m.settings=matchSettings(m.settings);
@@ -687,11 +699,13 @@ function load(){
     if(o&&typeof o==='object'){
       const s={settings:{...DEFAULTS,...(o.settings||{})},current:o.current||null,history:o.history||[],last:o.last||null};
       delete s.settings.railPerRail;
+      if((o.rulesVersion||0)<RULES_VERSION)s.settings.directMiss=DEFAULTS.directMiss;
+      s.rulesVersion=RULES_VERSION;
       s.history.forEach(migrateMatch);if(s.current)migrateMatch(s.current);
       return s;
     }
   }catch(e){}
-  return {settings:{...DEFAULTS},current:null,history:[],last:null};
+  return {settings:{...DEFAULTS},current:null,history:[],last:null,rulesVersion:RULES_VERSION};
 }
 let warnedFull=false;
 function save(){
@@ -700,6 +714,7 @@ function save(){
 }
 
 let store=load();
+save();   /* stamps the rules version right away */
 const ui={
   names:store.last?store.last.names.slice():['',''],
   total:store.last?store.last.total:1,
@@ -810,9 +825,12 @@ function replay(game,S){
       }
       if(a.res==='made'){
         if(st.groups[p]===null&&a.group){st.groups[p]=a.group;st.groups[1-p]=a.group==='solids'?'stripes':'solids';}
-        st.streak++;
-        const parts=[{l:t('part.pocket'),pts:S.pocket},{l:b.l,pts:b.pts}];
-        if(st.streak>=S.streakStart){parts.push({l:t('part.streak'),pts:S.streakBonus});s.streakPts=r4(s.streakPts+S.streakBonus);}
+        const counts=a.kind!=='direct'||S.streakCountsDirect;
+        if(counts)st.streak++;
+        const parts=a.kind==='direct'&&S.directTotal
+          ?[{l:b.l,pts:b.pts}]
+          :[{l:t('part.pocket'),pts:S.pocket},{l:b.l,pts:b.pts}];
+        if(counts&&st.streak>=S.streakStart){parts.push({l:t('part.streak'),pts:S.streakBonus});s.streakPts=r4(s.streakPts+S.streakBonus);}
         s.made++;s.pocketed++;countKind(s,a,b);
         s.bestStreak=Math.max(s.bestStreak,st.streak);
         const title=a.kind==='rail'?t('ev.pocketRail',{n:b.n}):a.kind==='special'?b.short:a.kind==='direct'?t('ev.pocketDirect'):t('ev.pocketNormal');
@@ -1279,7 +1297,8 @@ function viewSheet(){
     body='<h2>'+E('rules.title')+'</h2><p class="hint">'+E('rules.intro')+'</p>'+
       FIELDS.map(([g,list])=>'<div class="setgroup"><h3>'+E('rules.g.'+g)+'</h3>'+list.map(k=>
         '<label class="setrow"><span>'+E('rules.f.'+k)+'</span><input type="number" inputmode="decimal" step="0.5" data-set="'+k+'" value="'+S[k]+'"></label>').join('')+'</div>').join('')+
-      '<div class="setgroup"><label class="setrow"><span>'+E('rules.streakBreak')+'</span><input type="checkbox" data-setb="streakIncludesBreak"'+(S.streakIncludesBreak?' checked':'')+'></label></div>'+
+      '<div class="setgroup"><label class="setrow"><span>'+E('rules.streakBreak')+'</span><input type="checkbox" data-setb="streakIncludesBreak"'+(S.streakIncludesBreak?' checked':'')+'></label>'+
+        '<label class="setrow"><span>'+E('rules.streakDirect')+'</span><input type="checkbox" data-setb="streakCountsDirect"'+(S.streakCountsDirect?' checked':'')+'></label></div>'+
       '<p class="note">'+E('rules.note',{toggle:t('shot.eightToggle')})+'</p>'+
       '<div class="stack"><button class="btn ghost big" data-act="resetRules">'+E('rules.reset')+'</button><button class="btn primary big" data-act="close">'+E('common.done')+'</button></div>';
   }
@@ -1426,7 +1445,11 @@ const H={
   },
   restore:()=>{fileInput.value='';fileInput.click();},
   rules:()=>{ui.sheet={type:'rules'};render();},
-  resetRules:()=>{store.settings={...DEFAULTS};save();render();},
+  resetRules:()=>{
+    store.settings={...DEFAULTS};
+    if(store.current&&store.current.stage!=='results')Object.assign(store.current.settings,DEFAULTS);
+    save();render();
+  },
   menu:()=>{ui.sheet={type:'menu'};render();},
   close:()=>{ui.sheet=null;render();},
   abandonAsk:()=>{ui.sheet={type:'abandon'};render();},
@@ -1505,7 +1528,10 @@ $app.addEventListener('click',e=>{
 });
 $app.addEventListener('input',e=>{
   const el=e.target;
-  if(el.dataset.name!==undefined){
+  if(el.dataset.set){
+    let v=parseFloat(el.value);
+    if(isFinite(v)){if(el.dataset.set==='streakStart')v=Math.max(1,Math.round(v));setRule(el.dataset.set,v);}
+  }else if(el.dataset.name!==undefined){
     ui.names[+el.dataset.name]=el.value;
     if(ui.err){ui.err='';const er=$app.querySelector('.err');if(er)er.remove();}
     const map=allTime().map;
@@ -1518,9 +1544,9 @@ $app.addEventListener('change',e=>{
     let v=parseFloat(el.value);
     if(!isFinite(v)){el.value=store.settings[el.dataset.set];return;}
     if(el.dataset.set==='streakStart')v=Math.max(1,Math.round(v));
-    store.settings[el.dataset.set]=v;el.value=v;save();
+    setRule(el.dataset.set,v);el.value=v;
   }else if(el.dataset.setb){
-    store.settings[el.dataset.setb]=el.checked;save();
+    setRule(el.dataset.setb,el.checked);
   }else if(el.dataset.toggle==='breakScratch'){
     ui.breakScratch=el.checked;render();
   }else if(el.dataset.cmp!==undefined){
